@@ -1,184 +1,156 @@
 // ============================================================================
-// Udemy Dual Subtitles - Background Script
+// Udemy Dual Subtitles - Background Script (v2 - Batching)
 // ============================================================================
 
 // Translation Cache (LRU)
-const CACHE_SIZE = 5000;
+const CACHE_SIZE = 10000; // Increased cache size
 const translationCache = new Map();
 
-// Pending translation promises to de-duplicate concurrent requests
-const pendingTranslations = new Map();
-
-// Subtitle File Cache (URL -> Map<Original, Translated>)
-const subtitleCache = new Map();
+// Subtitle File Cache (URL -> boolean)
+const processedVttFiles = new Set();
 
 /**
- * Translate a single text using Google Translate API
- * - Uses in-flight de-duplication via pendingTranslations
- * - Updates LRU cache on success
+ * Manages the LRU cache. If the cache is full, it removes the oldest entry.
  */
-async function translateText(text, targetLang = 'vi') {
-  // 1) Cache hit: return immediately
-  if (translationCache.has(text)) {
-    return translationCache.get(text);
-  }
-
-  // 2) In-flight request exists: reuse it
-  if (pendingTranslations.has(text)) {
-    return pendingTranslations.get(text);
-  }
-
-  // 3) Create a new in-flight request
-  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${targetLang}&dt=t&q=${encodeURIComponent(text)}`;
-
-  const promise = (async () => {
-    try {
-      const response = await fetch(url);
-      const responseText = await response.text();
-      let data;
-      try {
-        data = JSON.parse(responseText);
-      } catch (e) {
-        console.error('Translation error: Failed to parse JSON. Google might be blocking the request.');
-        return null; // Treat as a failed translation
-      }
-      if (data && data[0]) {
-        const translatedText = data[0].map(item => item[0]).join('');
-
-        // LRU: evict oldest if needed, then set
-        if (translationCache.size >= CACHE_SIZE) {
-          const firstKey = translationCache.keys().next().value;
-          translationCache.delete(firstKey);
-        }
-        translationCache.set(text, translatedText);
-        return translatedText;
-      }
-    } catch (error) {
-      console.error('Translation error:', error);
-    } finally {
-      // Remove from in-flight map regardless of success/failure
-      pendingTranslations.delete(text);
+function updateCache(key, value) {
+    if (translationCache.size >= CACHE_SIZE) {
+        const oldestKey = translationCache.keys().next().value;
+        translationCache.delete(oldestKey);
     }
-    return null;
-  })();
-
-  pendingTranslations.set(text, promise);
-  return promise;
+    translationCache.set(key, value);
 }
+
+/**
+ * Translates a batch of texts using a single API call.
+ * This is much more efficient than sending one request per line.
+ */
+async function translateBatch(texts, targetLang = 'vi') {
+    const textsToTranslate = texts.filter(t => t && !translationCache.has(t));
+    if (textsToTranslate.length === 0) {
+        return;
+    }
+
+    // The API is unofficial and works best with text joined by newlines.
+    const combinedText = textsToTranslate.join('\n');
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${targetLang}&dt=t&q=${encodeURIComponent(combinedText)}`;
+
+    try {
+        const response = await fetch(url);
+        const responseText = await response.text();
+        const data = JSON.parse(responseText);
+
+        if (data && data[0]) {
+            const translations = data[0];
+            translations.forEach((item, index) => {
+                const originalText = textsToTranslate[index];
+                const translatedText = item[0];
+                if (originalText && translatedText) {
+                    updateCache(originalText, translatedText);
+                }
+            });
+        } else {
+            throw new Error('Invalid translation response format');
+        }
+    } catch (error) {
+        console.error('Batch translation error:', error);
+    }
+}
+
 
 // ============================================================================
 // VTT Parsing & Batch Processing
 // ============================================================================
 
 /**
- * Parse VTT content to extract unique text lines
+ * Parse VTT content to extract unique, non-empty text lines.
  */
 function parseVTT(vttContent) {
-  const lines = vttContent.split(/\r?\n/);
-  const uniqueTexts = new Set();
+    const lines = vttContent.split(/\r?\n/);
+    const uniqueTexts = new Set();
 
-  let isText = false;
-  for (const line of lines) {
-    if (line.includes('-->')) {
-      isText = true;
-      continue;
+    for (const line of lines) {
+        // Ignore timestamps, metadata, and empty lines
+        if (line.includes('-->') || line.trim() === '' || line.startsWith('WEBVTT') || line.match(/^\d+$/)) {
+            continue;
+        }
+        // Clean up HTML tags and add to the set
+        const cleanText = line.replace(/<[^>]*>/g, '').trim();
+        if (cleanText) {
+            uniqueTexts.add(cleanText);
+        }
     }
-    if (line.trim() === '' || line.startsWith('WEBVTT') || line.match(/^\d+$/)) {
-      isText = false;
-      continue;
-    }
-    if (isText) {
-      // Remove HTML tags if any
-      const cleanText = line.replace(/<[^>]*>/g, '').trim();
-      if (cleanText) uniqueTexts.add(cleanText);
-    }
-  }
-  return Array.from(uniqueTexts);
+    return Array.from(uniqueTexts);
 }
 
 /**
- * Process subtitle file: Parse -> Translate All -> Cache
+ * Fetches a VTT file, parses it, and translates all lines in batches.
  */
 async function processSubtitleFile(url) {
-  if (subtitleCache.has(url)) return; // Already processing/processed
-
-  console.log('[Udemy Dual Subs] Intercepted subtitle file:', url);
-  subtitleCache.set(url, true); // Mark as processing
-
-  try {
-    const response = await fetch(url);
-    const text = await response.text();
-    const uniqueLines = parseVTT(text);
-
-    console.log(`[Udemy Dual Subs] Found ${uniqueLines.length} unique lines to translate.`);
-
-    // Translate in chunks to avoid rate limits
-    // We use a moderate concurrency to balance speed and safety
-    const CHUNK_SIZE = 6;
-    for (let i = 0; i < uniqueLines.length; i += CHUNK_SIZE) {
-      const chunk = uniqueLines.slice(i, i + CHUNK_SIZE);
-      await Promise.all(chunk.map(async (line) => {
-        // translateText handles caching internally
-        await translateText(line);
-      }));
-
-      // Small delay to be nice to the API
-      await new Promise(r => setTimeout(r, 50));
+    if (processedVttFiles.has(url)) {
+        return; // Already processed
     }
 
-    console.log('[Udemy Dual Subs] Full translation completed for:', url);
+    console.log(`[UDS] Pre-processing subtitle file: ${url}`);
+    processedVttFiles.add(url); // Mark as processed to avoid re-fetching
 
-  } catch (e) {
-    console.error('[Udemy Dual Subs] Failed to process subtitle file:', e);
-    subtitleCache.delete(url);
-  }
+    try {
+        const response = await fetch(url);
+        const vttContent = await response.text();
+        const uniqueLines = parseVTT(vttContent);
+
+        if (uniqueLines.length === 0) return;
+
+        console.log(`[UDS] Found ${uniqueLines.length} unique lines to pre-translate.`);
+
+        // Translate in chunks to be safe with API limits
+        const CHUNK_SIZE = 50; // A larger, more efficient chunk size
+        for (let i = 0; i < uniqueLines.length; i += CHUNK_SIZE) {
+            const chunk = uniqueLines.slice(i, i + CHUNK_SIZE);
+            await translateBatch(chunk);
+            // Optional: add a small delay between chunks if hitting rate limits
+            // await new Promise(r => setTimeout(r, 100));
+        }
+
+        console.log(`[UDS] Finished pre-translating for: ${url}`);
+
+    } catch (e) {
+        console.error(`[UDS] Failed to process subtitle file: ${url}`, e);
+        processedVttFiles.delete(url); // Allow retrying if it failed
+    }
 }
-
-// ============================================================================
-// Network Interception (Removed)
-// ============================================================================
-// NOTE: webRequest listener removed to comply with least privilege principle.
-// Subtitle pre-translation now triggered via chrome.runtime.sendMessage from content.js
-// when track URLs are detected via HTMLTrackElement.textTracks API.
 
 // ============================================================================
 // Message Handling
 // ============================================================================
 
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
-  if (request.action === 'preprocessVtt') {
-    const urls = Array.isArray(request.urls) ? request.urls : [];
-    urls.forEach((u) => {
-      try {
-        if (typeof u === 'string' && u) {
-          processSubtitleFile(u);
+    if (request.action === 'preprocessVtt') {
+        if (Array.isArray(request.urls)) {
+            request.urls.forEach(url => {
+                if (typeof url === 'string' && url) {
+                    processSubtitleFile(url);
+                }
+            });
         }
-      } catch (e) {
-        console.warn('[Udemy Dual Subs] Failed to preprocess URL:', u, e);
-      }
-    });
-    sendResponse({ success: true, processed: urls.length });
-    return; // sync response
-  }
-
-  if (request.action === 'translate') {
-    const text = request.text;
-
-    // 1. Check global cache first (fastest)
-    if (translationCache.has(text)) {
-      sendResponse({ success: true, translatedText: translationCache.get(text) });
-      return true;
+        // No response needed, this is a fire-and-forget task.
+        return;
     }
 
-    // 2. Fallback to on-demand translation (deduplicated)
-    translateText(text).then(translatedText => {
-      if (translatedText) {
-        sendResponse({ success: true, translatedText });
-      } else {
-        sendResponse({ success: false, error: 'Translation failed' });
-      }
-    });
-
-    return true; // Keep channel open for async response
-  }
+    if (request.action === 'translate') {
+        const text = request.text;
+        if (translationCache.has(text)) {
+            sendResponse({ success: true, translatedText: translationCache.get(text) });
+        } else {
+            // If not in cache, it means pre-translation might still be running or failed.
+            // We do a quick on-demand translation as a fallback.
+            translateBatch([text]).then(() => {
+                if (translationCache.has(text)) {
+                    sendResponse({ success: true, translatedText: translationCache.get(text) });
+                } else {
+                    sendResponse({ success: false, error: 'On-demand translation failed.' });
+                }
+            });
+        }
+        return true; // Keep channel open for async response
+    }
 });
