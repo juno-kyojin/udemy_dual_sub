@@ -1,5 +1,5 @@
 // ============================================================================
-// Udemy Dual Subtitles - Content Script (v3 - CueChange Primary)
+// Udemy Dual Subtitles - Content Script (v9 - Final Observer)
 // ============================================================================
 
 // --- STATE ---
@@ -13,9 +13,10 @@ let settings = {
 };
 let lastOriginalText = '';
 let overlayElement = null;
+let mutationObserver = null;
+let mutationDebounceTimer = null;
 let videoElement = null;
-let activeTrack = null;
-let mutationObserver = null; // Fallback observer
+let seekHandler = null;
 
 // ============================================================================
 // SETTINGS MANAGEMENT
@@ -30,9 +31,8 @@ function applySettings(result) {
     settings.bgColor = result.bgColor || settings.bgColor;
     console.log('[UDS] Settings updated');
 
-    // Force re-render with new styles if a subtitle is visible
     if (lastOriginalText) {
-        processSubtitle(lastOriginalText, true); // Use force flag
+        processSubtitle(lastOriginalText, true); // Force re-render
     }
 }
 
@@ -148,12 +148,11 @@ function clearOverlay() {
 }
 
 // ============================================================================
-// CORE LOGIC
+// CORE LOGIC & EVENT HANDLERS
 // ============================================================================
 
 async function processSubtitle(originalText, force = false) {
     const trimmedText = originalText ? originalText.trim() : '';
-    // Guard against re-processing the same text, unless forced (e.g., by settings change)
     if (!trimmedText || (!force && trimmedText === lastOriginalText)) {
         return;
     }
@@ -165,7 +164,7 @@ async function processSubtitle(originalText, force = false) {
         return;
     }
 
-    renderSubtitles(trimmedText, '...'); // Render original immediately
+    renderSubtitles(trimmedText, '...');
 
     try {
         const lines = trimmedText.split(/\r?\n+/).map(t => t.trim()).filter(Boolean);
@@ -173,7 +172,6 @@ async function processSubtitle(originalText, force = false) {
         const translatedCombined = translatedLines.join('\n');
 
         if (lastOriginalText === trimmedText) {
-            console.log(`[UDS] Render dual for: "${trimmedText.substring(0, 30)}..."`);
             renderSubtitles(trimmedText, translatedCombined);
         }
     } catch (error) {
@@ -182,29 +180,22 @@ async function processSubtitle(originalText, force = false) {
     }
 }
 
-// Main event handler for subtitle changes
-function onCueChange() {
-    // The most reliable source is the active cue from the text track.
-    if (activeTrack && activeTrack.activeCues && activeTrack.activeCues.length > 0) {
-        const originalText = activeTrack.activeCues[0].text;
+// This is the single handler for all subtitle changes.
+function handleSubtitleChange() {
+    const nativeCue = getNativeCueElement();
+    const originalText = nativeCue ? (nativeCue.textContent || nativeCue.innerText) : '';
+
+    if (originalText) {
         processSubtitle(originalText);
     } else {
-        // Fallback for players that don't fire cuechange reliably.
-        const nativeCue = getNativeCueElement();
-        const originalText = nativeCue ? (nativeCue.textContent || nativeCue.innerText) : '';
-        if (originalText) {
-            processSubtitle(originalText);
-        } else {
-            clearOverlay();
-        }
+        clearOverlay();
     }
 }
 
-// Handler for video seek events
 function onVideoSeeked() {
-    console.log('[UDS] Video seeked - clearing cached subtitle state');
-    lastOriginalText = ''; // Clear cache to force re-translation
-    onCueChange(); // Immediately process current subtitle
+    console.log('[UDS] Video seeked. Clearing last text.');
+    lastOriginalText = '';
+    handleSubtitleChange();
 }
 
 // ============================================================================
@@ -213,38 +204,31 @@ function onVideoSeeked() {
 
 function setupListeners() {
     console.log('[UDS] Setting up listeners...');
-    videoElement = document.querySelector('video');
     const nativeContainer = getNativeContainer();
+    videoElement = document.querySelector('video');
 
-    if (!videoElement || !nativeContainer) {
+    if (!nativeContainer || !videoElement) {
         setTimeout(setupListeners, 1000);
         return;
     }
 
-    // --- Video Event: Handle seeking ---
-    videoElement.addEventListener('seeked', onVideoSeeked);
-    console.log('[UDS] Video seek listener attached.');
+    // --- Main Method: MutationObserver ---
+    // We observe the container for any changes to its children or their text content.
+    mutationObserver = new MutationObserver(() => {
+        clearTimeout(mutationDebounceTimer);
+        mutationDebounceTimer = setTimeout(handleSubtitleChange, 50);
+    });
+    mutationObserver.observe(nativeContainer, {
+        childList: true,
+        subtree: true,
+        characterData: true // This is the key to detecting text changes
+    });
+    console.log('[UDS] Observer attached.');
 
-    // --- Primary Method: TextTrack `cuechange` event ---
-    const tracks = videoElement.textTracks;
-    const onTrackChange = () => {
-        console.log('[UDS] Track changed.');
-        if (activeTrack) activeTrack.removeEventListener('cuechange', onCueChange);
-        activeTrack = Array.from(tracks).find(t => t.mode === 'showing');
-        if (activeTrack) {
-            console.log('[UDS] Attached to active text track.');
-            activeTrack.addEventListener('cuechange', onCueChange);
-            onCueChange(); // Initial trigger
-        }
-    };
-    tracks.addEventListener('change', onTrackChange);
-    onTrackChange(); // Initial setup
-
-    // --- Fallback Method: MutationObserver ---
-    if (mutationObserver) mutationObserver.disconnect();
-    mutationObserver = new MutationObserver(onCueChange);
-    mutationObserver.observe(nativeContainer, { childList: true, subtree: true });
-    console.log('[UDS] Fallback observer attached.');
+    // --- Video seek event ---
+    seekHandler = onVideoSeeked;
+    videoElement.addEventListener('seeked', seekHandler);
+    console.log('[UDS] Seek listener attached.');
 }
 
 function initialize() {
@@ -261,24 +245,25 @@ function initialize() {
 function reset() {
     console.log('[UDS] Resetting for new page...');
     if (mutationObserver) mutationObserver.disconnect();
-    if (activeTrack) activeTrack.removeEventListener('cuechange', onCueChange);
-    if (videoElement) videoElement.removeEventListener('seeked', onVideoSeeked);
+    if (videoElement && seekHandler) {
+        videoElement.removeEventListener('seeked', seekHandler);
+    }
     clearOverlay();
-    videoElement = null;
-    activeTrack = null;
     overlayElement = null;
     mutationObserver = null;
+    videoElement = null;
+    seekHandler = null;
     setTimeout(initialize, 1500);
 }
 
 function patchHistoryAPI() {
     const originalPushState = history.pushState;
-    history.pushState = function (...args) {
+    history.pushState = function(...args) {
         originalPushState.apply(this, args);
         reset();
     };
     const originalReplaceState = history.replaceState;
-    history.replaceState = function (...args) {
+    history.replaceState = function(...args) {
         originalReplaceState.apply(this, args);
         reset();
     };
