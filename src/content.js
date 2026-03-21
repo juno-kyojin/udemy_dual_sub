@@ -1,9 +1,10 @@
 // ============================================================================
-// Udemy Dual Subtitles - Content Script (v9 - Final Observer)
+// Udemy Dual Subtitles - Content Script (v13 - Show Both Together)
 // ============================================================================
 
 // --- STATE ---
 let enabled = true;
+let targetLanguage = 'vi';
 let settings = {
     fontSize: 16,
     fontColor: '#FFFFFF',
@@ -18,26 +19,77 @@ let mutationDebounceTimer = null;
 let videoElement = null;
 let seekHandler = null;
 
+// Translation queue for batching
+let translationQueue = [];
+let translationDebounceTimer = null;
+let isTranslating = false;
+const DEBOUNCE_MS = 30;
+const MUTATION_DEBOUNCE_MS = 30;
+
+// Timeouts
+const MESSAGE_TIMEOUT_MS = 3000;
+const API_TIMEOUT_MS = 5000;
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * Wraps a promise with a timeout
+ */
+function withTimeout(promise, ms, errorMessage) {
+    const timeout = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error(errorMessage)), ms)
+    );
+    return Promise.race([promise, timeout]);
+}
+
+/**
+ * Safely sends a message to background script with timeout and error handling
+ */
+async function safeSendMessage(message, timeoutMs = MESSAGE_TIMEOUT_MS) {
+    try {
+        if (!chrome.runtime?.id) {
+            throw new Error('Extension context invalidated');
+        }
+        return await withTimeout(
+            chrome.runtime.sendMessage(message),
+            timeoutMs,
+            'Message timeout'
+        );
+    } catch (error) {
+        if (error.message.includes('Extension context invalidated') || 
+            error.message.includes('Could not establish connection')) {
+            console.warn('[UDS] Extension reloaded, reinitializing...');
+            reset();
+            return null;
+        }
+        console.error('[UDS] Message failed:', error.message);
+        return null;
+    }
+}
+
 // ============================================================================
 // SETTINGS MANAGEMENT
 // ============================================================================
 
 function applySettings(result) {
     enabled = result.enabled !== undefined ? result.enabled : enabled;
+    targetLanguage = result.targetLanguage || targetLanguage;
     settings.fontSize = result.fontSize || settings.fontSize;
     settings.fontColor = result.fontColor || settings.fontColor;
     settings.fontWeight = result.fontWeight || settings.fontWeight;
     settings.opacity = result.opacity !== undefined ? result.opacity : settings.opacity;
     settings.bgColor = result.bgColor || settings.bgColor;
-    console.log('[UDS] Settings updated');
+    console.log('[UDS] Settings updated, targetLanguage:', targetLanguage);
 
     if (lastOriginalText) {
-        processSubtitle(lastOriginalText, true); // Force re-render
+        processSubtitle(lastOriginalText, true);
     }
 }
 
 function loadSettings() {
-    chrome.storage.local.get(Object.keys(settings), (result) => {
+    chrome.storage.local.get(['enabled', 'targetLanguage', ...Object.keys(settings)], (result) => {
         console.log('[UDS] Initial settings loaded');
         applySettings(result);
     });
@@ -51,22 +103,67 @@ function loadSettings() {
 }
 
 // ============================================================================
-// TRANSLATION
+// TRANSLATION (Queue-based batching)
 // ============================================================================
 
-async function translateText(text) {
-    if (!text) return '';
-    return new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage({ action: 'translate', text }, (response) => {
-            if (chrome.runtime.lastError) {
-                return reject(new Error(chrome.runtime.lastError.message));
-            }
-            if (response && response.success) {
-                resolve(response.translatedText);
-            } else {
-                reject(new Error(response?.error || 'Translation failed'));
-            }
+async function translateQueue() {
+    if (isTranslating || translationQueue.length === 0) return;
+    
+    isTranslating = true;
+    const currentQueue = [...translationQueue];
+    translationQueue = [];
+    
+    const textsToTranslate = currentQueue
+        .map(item => item.text)
+        .filter(t => t && t.trim());
+    
+    if (textsToTranslate.length === 0) {
+        isTranslating = false;
+        return;
+    }
+
+    try {
+        const response = await safeSendMessage({
+            action: 'translateBatch',
+            texts: textsToTranslate,
+            targetLang: targetLanguage
         });
+
+        if (response && response.success && response.translations) {
+            currentQueue.forEach((item, index) => {
+                if (response.translations[index]) {
+                    item.resolve(response.translations[index]);
+                } else {
+                    item.resolve('');
+                }
+            });
+        } else {
+            currentQueue.forEach(item => item.resolve(''));
+        }
+    } catch (error) {
+        console.error('[UDS] Batch translation error:', error);
+        currentQueue.forEach(item => item.resolve(''));
+    }
+
+    isTranslating = false;
+    
+    if (translationQueue.length > 0) {
+        translationDebounceTimer = setTimeout(translateQueue, 50);
+    }
+}
+
+function queueTranslation(text) {
+    return new Promise((resolve) => {
+        translationQueue.push({ text, resolve });
+        
+        if (!isTranslating) {
+            clearTimeout(translationDebounceTimer);
+            if (translationQueue.length === 1) {
+                translateQueue();
+            } else {
+                translationDebounceTimer = setTimeout(translateQueue, DEBOUNCE_MS);
+            }
+        }
     });
 }
 
@@ -81,11 +178,13 @@ function escapeHtml(text) {
 }
 
 function getNativeContainer() {
-    return document.querySelector('.well--container--afdWD, .captions-display--captions-container--1bCR_, [data-purpose*="captions-container"]');
+    const container = document.querySelector('.well--container--afdWD, .captions-display--captions-container--1bCR_, [data-purpose*="captions-container"]');
+    return container;
 }
 
 function getNativeCueElement() {
-    return document.querySelector('[data-purpose="captions-cue-text"], [class^="well--text--"]');
+    const cue = document.querySelector('[data-purpose="captions-cue-text"], [class^="well--text--"]');
+    return cue;
 }
 
 function createOverlay() {
@@ -93,7 +192,9 @@ function createOverlay() {
     if (overlay) return overlay;
 
     const nativeContainer = getNativeContainer();
-    if (!nativeContainer) return null;
+    if (!nativeContainer) {
+        return null;
+    }
 
     overlay = document.createElement('div');
     overlay.id = 'uds-overlay';
@@ -108,7 +209,7 @@ function createOverlay() {
     return overlay;
 }
 
-function renderSubtitles(original, translated) {
+function renderSubtitles(original, translated, isLoading = false) {
     if (!overlayElement) return;
 
     const nativeCue = getNativeCueElement();
@@ -127,12 +228,11 @@ function renderSubtitles(original, translated) {
     `.trim();
 
     const originalHtml = escapeHtml(original).replace(/\r?\n/g, '<br/>');
-    const translatedHtml = translated ? escapeHtml(translated).replace(/\r?\n/g, '<br/>') : '';
+    const translatedHtml = (translated && !isLoading) 
+        ? `<div style="${translationStyles}">${escapeHtml(translated).replace(/\r?\n/g, '<br/>')}</div>` 
+        : '';
 
-    let finalHtml = `<div style="font-size: ${originalFontSize}; color: white; background-color: rgba(0, 0, 0, 0.75); padding: 4px 8px; border-radius: 3px; line-height: 1.4;">${originalHtml}</div>`;
-    if (translatedHtml) {
-        finalHtml += `<div style="${translationStyles}">${translatedHtml}</div>`;
-    }
+    const finalHtml = `<div style="font-size: ${originalFontSize}; color: white; background-color: rgba(0, 0, 0, 0.75); padding: 4px 8px; border-radius: 3px; line-height: 1.4;">${originalHtml}</div>${translatedHtml}`;
 
     overlayElement.innerHTML = `<div style="display: flex; flex-direction: column; align-items: center; gap: 4px;">${finalHtml}</div>`;
 }
@@ -156,31 +256,57 @@ async function processSubtitle(originalText, force = false) {
     if (!trimmedText || (!force && trimmedText === lastOriginalText)) {
         return;
     }
-    console.log(`[UDS] Processing cue: "${trimmedText.substring(0, 30)}..."`);
+    
+    const startTime = performance.now();
     lastOriginalText = trimmedText;
 
     if (!enabled) {
-        renderSubtitles(trimmedText, null);
+        renderSubtitles(trimmedText, '');
         return;
     }
 
-    renderSubtitles(trimmedText, '...');
+    const lines = trimmedText.split(/\r?\n+/).map(t => t.trim()).filter(Boolean);
 
     try {
-        const lines = trimmedText.split(/\r?\n+/).map(t => t.trim()).filter(Boolean);
-        const translatedLines = await Promise.all(lines.map(translateText));
-        const translatedCombined = translatedLines.join('\n');
+        // Check cache first with timeout
+        const cacheResponse = await safeSendMessage({
+            action: 'checkCache',
+            texts: lines,
+            targetLang: targetLanguage
+        }, MESSAGE_TIMEOUT_MS);
 
-        if (lastOriginalText === trimmedText) {
+        // If extension was reloaded/reset, abort
+        if (!overlayElement) return;
+
+        if (cacheResponse && cacheResponse.success && cacheResponse.allCached) {
+            // All cached - show immediately!
+            const translatedCombined = cacheResponse.translations.join('\n');
             renderSubtitles(trimmedText, translatedCombined);
+            console.log(`[UDS] Cached - instant display`);
+            return;
         }
+
+        // Not all cached - translate and show both together
+        const translatedLines = await Promise.all(lines.map(line => queueTranslation(line)));
+        
+        // Check if still valid after async operations
+        if (!overlayElement || lastOriginalText !== trimmedText) return;
+        
+        const translatedCombined = translatedLines.join('\n');
+        
+        // Show both original + translation together
+        renderSubtitles(trimmedText, translatedCombined);
+        const translationTime = performance.now() - startTime;
+        console.log(`[UDS] Translation complete in ${translationTime.toFixed(0)}ms - showing both`);
     } catch (error) {
         console.error('[UDS] Translation failed:', error);
-        renderSubtitles(trimmedText, null);
+        // Fallback: show original only (in case of timeout or error)
+        if (overlayElement && lastOriginalText === trimmedText) {
+            renderSubtitles(trimmedText, '');
+        }
     }
 }
 
-// This is the single handler for all subtitle changes.
 function handleSubtitleChange() {
     const nativeCue = getNativeCueElement();
     const originalText = nativeCue ? (nativeCue.textContent || nativeCue.innerText) : '';
@@ -193,8 +319,8 @@ function handleSubtitleChange() {
 }
 
 function onVideoSeeked() {
-    console.log('[UDS] Video seeked. Clearing last text.');
     lastOriginalText = '';
+    translationQueue = [];
     handleSubtitleChange();
 }
 
@@ -203,7 +329,6 @@ function onVideoSeeked() {
 // ============================================================================
 
 function setupListeners() {
-    console.log('[UDS] Setting up listeners...');
     const nativeContainer = getNativeContainer();
     videoElement = document.querySelector('video');
 
@@ -212,47 +337,68 @@ function setupListeners() {
         return;
     }
 
-    // --- Main Method: MutationObserver ---
-    // We observe the container for any changes to its children or their text content.
     mutationObserver = new MutationObserver(() => {
         clearTimeout(mutationDebounceTimer);
-        mutationDebounceTimer = setTimeout(handleSubtitleChange, 50);
+        mutationDebounceTimer = setTimeout(handleSubtitleChange, MUTATION_DEBOUNCE_MS);
     });
     mutationObserver.observe(nativeContainer, {
         childList: true,
         subtree: true,
-        characterData: true // This is the key to detecting text changes
+        characterData: true
     });
-    console.log('[UDS] Observer attached.');
 
-    // --- Video seek event ---
     seekHandler = onVideoSeeked;
     videoElement.addEventListener('seeked', seekHandler);
-    console.log('[UDS] Seek listener attached.');
 }
 
 function initialize() {
-    console.log('[UDS] Initializing...');
     overlayElement = createOverlay();
     if (!overlayElement) {
         setTimeout(initialize, 1000);
         return;
     }
     setupListeners();
-    preprocessSubtitleTracks();
+    // Try to extract transcript texts for pre-translation
+    setTimeout(preprocessTranscript, 2000);
 }
 
 function reset() {
-    console.log('[UDS] Resetting for new page...');
-    if (mutationObserver) mutationObserver.disconnect();
+    console.log('[UDS] Resetting state...');
+    
+    // Clear all timers
+    if (mutationDebounceTimer) {
+        clearTimeout(mutationDebounceTimer);
+        mutationDebounceTimer = null;
+    }
+    if (translationDebounceTimer) {
+        clearTimeout(translationDebounceTimer);
+        translationDebounceTimer = null;
+    }
+    
+    // Disconnect observer
+    if (mutationObserver) {
+        mutationObserver.disconnect();
+        mutationObserver = null;
+    }
+    
+    // Remove event listeners
     if (videoElement && seekHandler) {
         videoElement.removeEventListener('seeked', seekHandler);
     }
+    
+    // Clear pending translations
+    translationQueue = [];
+    isTranslating = false;
+    
+    // Clear UI
     clearOverlay();
+    
+    // Reset state
     overlayElement = null;
-    mutationObserver = null;
     videoElement = null;
     seekHandler = null;
+    lastOriginalText = '';
+    
     setTimeout(initialize, 1500);
 }
 
@@ -270,13 +416,76 @@ function patchHistoryAPI() {
     window.addEventListener('popstate', reset);
 }
 
-function preprocessSubtitleTracks() {
-    const urls = Array.from(document.querySelectorAll('track[src]'))
-        .map(t => new URL(t.src, location.href).href)
-        .filter(u => u.includes('.vtt') || u.includes('caption'));
-    if (urls.length > 0) {
-        chrome.runtime.sendMessage({ action: 'preprocessVtt', urls });
+// ============================================================================
+// TRANSCRIPT PRE-TRANSLATION
+// ============================================================================
+
+async function preprocessTranscript() {
+    console.log('[UDS] Looking for transcript panel...');
+    
+    // Check if transcript panel is open or can be opened
+    const transcriptTexts = extractTranscriptTexts();
+    
+    if (transcriptTexts.length === 0) {
+        console.log('[UDS] No transcript texts found. Open transcript panel to pre-translate all subtitles.');
+        return;
     }
+    
+    console.log(`[UDS] Found ${transcriptTexts.length} transcript texts to pre-translate`);
+    
+    // Send to background for pre-translation
+    try {
+        const response = await safeSendMessage({
+            action: 'preprocessTexts',
+            texts: transcriptTexts,
+            targetLang: targetLanguage
+        }, MESSAGE_TIMEOUT_MS * 2); // Longer timeout for batch processing
+        
+        if (response && response.success) {
+            console.log(`[UDS] Pre-translation complete: ${response.cached}/${transcriptTexts.length} texts cached`);
+        }
+    } catch (error) {
+        console.warn('[UDS] Pre-translation failed:', error.message);
+        // Non-critical, continue without pre-translation
+    }
+}
+
+function extractTranscriptTexts() {
+    const texts = [];
+    
+    // Try various selectors for transcript cues
+    const selectors = [
+        '[data-purpose="transcript-cue-text"]',
+        '[class*="transcript-cue"]',
+        '[class*="cue-text"]',
+        '.transcript--text',
+        // Transcript panel is usually in sidebar
+        '[data-purpose="sidebar-content"] [class*="cue"]',
+        '[class*="transcript-panel"] [class*="cue"]',
+    ];
+    
+    selectors.forEach(selector => {
+        document.querySelectorAll(selector).forEach(el => {
+            const text = el.textContent?.trim();
+            if (text && text.length > 2 && text.length < 500 && !texts.includes(text)) {
+                texts.push(text);
+            }
+        });
+    });
+    
+    // Also look for elements with timestamp + text pattern
+    document.querySelectorAll('div, span, p').forEach(el => {
+        const text = el.textContent?.trim() || '';
+        // Match patterns like "0:00 Text here" or "00:00 Text here"
+        if (/^\d{1,2}:\d{2}/.test(text)) {
+            const cleanText = text.replace(/^\d{1,2}:\d{2}\s*/, '').trim();
+            if (cleanText && cleanText.length > 2 && cleanText.length < 300 && !texts.includes(cleanText)) {
+                texts.push(cleanText);
+            }
+        }
+    });
+    
+    return texts;
 }
 
 // --- SCRIPT START ---
