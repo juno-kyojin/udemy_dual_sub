@@ -56,7 +56,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ============================================================================
 
     chrome.storage.local.get(
-        ['enabled', 'fontSize', 'fontColor', 'fontWeight', 'opacity', 'bgColor'],
+        ['enabled', 'fontSize', 'fontColor', 'fontWeight', 'opacity', 'bgColor', 'targetLanguage'],
         (result) => {
             // Enable toggle
             if (enabledToggle) {
@@ -93,6 +93,12 @@ document.addEventListener('DOMContentLoaded', () => {
             // Background color
             if (bgColorInput) {
                 bgColorInput.value = result.bgColor || '#000000';
+            }
+
+            // Target language
+            const targetLanguageSelect = document.getElementById('targetLanguage');
+            if (targetLanguageSelect) {
+                targetLanguageSelect.value = result.targetLanguage || 'vi';
             }
         }
     );
@@ -150,6 +156,14 @@ document.addEventListener('DOMContentLoaded', () => {
     if (bgColorInput) {
         bgColorInput.addEventListener('input', () => {
             chrome.storage.local.set({ bgColor: bgColorInput.value });
+        });
+    }
+
+    // Target language
+    const targetLanguageSelect = document.getElementById('targetLanguage');
+    if (targetLanguageSelect) {
+        targetLanguageSelect.addEventListener('change', () => {
+            chrome.storage.local.set({ targetLanguage: targetLanguageSelect.value });
         });
     }
 
